@@ -4,7 +4,7 @@ import { MySQLConnection } from "@malloydata/db-mysql";
 import { PostgresConnection } from "@malloydata/db-postgres";
 import { SnowflakeConnection } from "@malloydata/db-snowflake";
 import { TrinoConnection } from "@malloydata/db-trino";
-import { Connection } from "@malloydata/malloy";
+import { Connection, TableSourceDef } from "@malloydata/malloy";
 import { BaseConnection } from "@malloydata/malloy/connection";
 import { AxiosError } from "axios";
 import fs from "fs/promises";
@@ -13,7 +13,115 @@ import { v4 as uuidv4 } from "uuid";
 import { components } from "../api";
 import { TEMP_DIR_PATH } from "../constants";
 import { logAxiosError, logger } from "../logger";
+import { getDatabaseToken } from "../request_context";
 import { CloudStorageCredentials } from "./gcs_s3_utils";
+
+/** Configuration needed to create per-request OAuth Snowflake connections. */
+export interface SnowflakeOAuthConfig {
+   name: string;
+   account: string;
+   warehouse: string;
+   database?: string;
+   schema?: string;
+   role?: string;
+   responseTimeoutMilliseconds?: number;
+}
+
+/**
+ * Creates a per-request SnowflakeConnection using an OAuth token.
+ * The caller is responsible for closing the connection after use.
+ */
+export function createOAuthSnowflakeConnection(
+   config: SnowflakeOAuthConfig,
+   token: string,
+): SnowflakeConnection {
+   return new SnowflakeConnection(config.name, {
+      connOptions: {
+         account: config.account,
+         authenticator: "OAUTH",
+         token,
+         warehouse: config.warehouse,
+         database: config.database,
+         schema: config.schema,
+         role: config.role,
+         timeout: config.responseTimeoutMilliseconds,
+      },
+   });
+}
+
+/**
+ * Metadata attached to Snowflake connections in the connection map when
+ * oauthPassthrough is enabled. Allows downstream code to create per-request
+ * OAuth connections using the same base config.
+ */
+const oauthConfigMap = new Map<string, SnowflakeOAuthConfig>();
+
+/** Store OAuth config for a named connection. */
+export function setOAuthConfig(
+   connectionName: string,
+   config: SnowflakeOAuthConfig,
+): void {
+   oauthConfigMap.set(connectionName, config);
+}
+
+/** Get OAuth config for a named connection, if oauthPassthrough is enabled. */
+export function getOAuthConfig(
+   connectionName: string,
+): SnowflakeOAuthConfig | undefined {
+   return oauthConfigMap.get(connectionName);
+}
+
+/**
+ * If the current request has a database token and any connection in the map
+ * has oauthPassthrough enabled, returns a new connection map with per-request
+ * OAuth Snowflake connections. Otherwise returns the original map unchanged.
+ *
+ * The caller must call closeOAuthConnections() on the returned connections
+ * after the query completes.
+ */
+export function getRequestConnections(connections: Map<string, Connection>): {
+   connections: Map<string, Connection>;
+   oauthConnections: Connection[];
+} {
+   const token = getDatabaseToken();
+   if (!token) {
+      return { connections, oauthConnections: [] };
+   }
+
+   const overridden = new Map(connections);
+   const oauthConnections: Connection[] = [];
+
+   for (const [name] of connections) {
+      const config = getOAuthConfig(name);
+      if (config) {
+         const oauthConn = createOAuthSnowflakeConnection(config, token);
+         overridden.set(name, oauthConn);
+         oauthConnections.push(oauthConn);
+         logger.info(
+            `[OAuth] Created per-request Snowflake connection for '${name}'`,
+         );
+      }
+   }
+
+   return { connections: overridden, oauthConnections };
+}
+
+/** Close per-request OAuth connections to prevent session leaks. */
+export async function closeOAuthConnections(
+   oauthConnections: Connection[],
+): Promise<void> {
+   for (const conn of oauthConnections) {
+      try {
+         if ("close" in conn && typeof conn.close === "function") {
+            await conn.close();
+         }
+      } catch (err) {
+         logger.warn(`[OAuth] Error closing per-request connection`, {
+            error: err,
+         });
+      }
+   }
+}
 
 type AttachedDatabase = components["schemas"]["AttachedDatabase"];
 type ApiConnection = components["schemas"]["Connection"];
@@ -29,6 +137,7 @@ export type InternalConnection = ApiConnection & {
    trinoConnection?: components["schemas"]["TrinoConnection"];
    mysqlConnection?: components["schemas"]["MysqlConnection"];
    duckdbConnection?: components["schemas"]["DuckdbConnection"];
+   ducklakeConnection?: components["schemas"]["DucklakeConnection"];
 };
 
 function validateAndBuildTrinoConfig(
@@ -345,6 +454,40 @@ async function attachSnowflake(
    logger.info(`Successfully attached Snowflake database: ${attachedDb.name}`);
 }
 
+function buildPgConnectionString(
+   pg: components["schemas"]["PostgresConnection"],
+): string {
+   if (pg.connectionString) {
+      return pg.connectionString;
+   }
+
+   const parts: string[] = [];
+   if (pg.host) parts.push(`host=${pg.host}`);
+   if (pg.port) parts.push(`port=${pg.port}`);
+   if (pg.databaseName) parts.push(`dbname=${pg.databaseName}`);
+   if (pg.userName) parts.push(`user=${pg.userName}`);
+   if (pg.password) parts.push(`password=${pg.password}`);
+
+   const pgSSLMode = process.env.PGSSLMODE;
+
+   if (pgSSLMode) {
+      const mapping: Record<string, string> = {
+         "no-verify": "disable",
+         disable: "disable",
+         allow: "allow",
+         prefer: "prefer",
+         require: "require",
+         "verify-ca": "verify-ca",
+         "verify-full": "verify-full",
+      };
+
+      const sslmode = mapping[pgSSLMode.toLowerCase()];
+      if (sslmode) parts.push(`sslmode=${sslmode}`);
+   }
+
+   return parts.join(" ");
+}
+
 async function attachPostgres(
    connection: DuckDBConnection,
    attachedDb: AttachedDatabase,
@@ -358,24 +501,80 @@ async function attachPostgres(
    await installAndLoadExtension(connection, "postgres");
 
    const config = attachedDb.postgresConnection;
-   let attachString: string;
+   const attachString: string = buildPgConnectionString(config);
 
-   if (config.connectionString) {
-      attachString = config.connectionString;
-   } else {
-      const parts: string[] = [];
-      if (config.host) parts.push(`host=${config.host}`);
-      if (config.port) parts.push(`port=${config.port}`);
-      if (config.databaseName) parts.push(`dbname=${config.databaseName}`);
-      if (config.userName) parts.push(`user=${config.userName}`);
-      if (config.password) parts.push(`password=${config.password}`);
-      if (process.env.PGSSLMODE === "no-verify") parts.push(`sslmode=disable`);
-      attachString = parts.join(" ");
-   }
-
-   const attachCommand = `ATTACH '${attachString}' AS ${attachedDb.name} (TYPE postgres, READ_ONLY);`;
+   const attachCommand = `ATTACH '${escapeSQL(attachString)}' AS ${attachedDb.name} (TYPE postgres, READ_ONLY);`;
    await connection.runSQL(attachCommand);
    logger.info(`Successfully attached PostgreSQL database: ${attachedDb.name}`);
+}
+
+async function attachDuckLake(
+   connection: DuckDBConnection,
+   dbName: string,
+   ducklakeConfig: components["schemas"]["DucklakeConnection"],
+): Promise<void> {
+   await installAndLoadExtension(connection, "ducklake");
+   await installAndLoadExtension(connection, "postgres");
+   await installAndLoadExtension(connection, "aws");
+   await installAndLoadExtension(connection, "httpfs");
+   if (!ducklakeConfig.catalog?.postgresConnection) {
+      throw new Error(
+         `PostgreSQL connection configuration is required for DuckLake catalog: ${dbName}`,
+      );
+   }
+
+   if (!ducklakeConfig.storage?.bucketUrl) {
+      throw new Error(`Storage bucketUrl is required for DuckLake: ${dbName}`);
+   }
+
+   // Set up cloud storage secret so DuckDB can access S3/GCS
+   const hasS3 = !!ducklakeConfig.storage.s3Connection;
+   const hasGCS = !!ducklakeConfig.storage.gcsConnection;
+
+   if (hasS3) {
+      await attachCloudStorage(connection, {
+         name: `${dbName}_storage`,
+         type: "s3",
+         s3Connection: ducklakeConfig.storage.s3Connection,
+      });
+   } else if (hasGCS) {
+      await attachCloudStorage(connection, {
+         name: `${dbName}_storage`,
+         type: "gcs",
+         gcsConnection: ducklakeConfig.storage.gcsConnection,
+      });
+   }
+
+   const pg = ducklakeConfig.catalog.postgresConnection;
+   const pgConnString: string = buildPgConnectionString(pg);
+   // Attach DuckLake with Postgres catalog and cloud storage data path in READ_ONLY mode
+   // The client manages metadata - we only read from the catalogs
+   logger.info(`pgConnString: ${pgConnString}`);
+   const escapedPgConnString = escapeSQL(pgConnString);
+   logger.info(`Final escaped connection string: ${escapedPgConnString}`);
+   const escapedBucketUrl = escapeSQL(ducklakeConfig.storage.bucketUrl);
+   logger.info(`escapedBucketUrl: ${escapedBucketUrl}`);
+   const attachCommand = `ATTACH OR REPLACE 'ducklake:postgres:${escapedPgConnString}' AS ${dbName} (DATA_PATH '${escapedBucketUrl}', OVERRIDE_DATA_PATH true, READ_ONLY true);`;
+   logger.info(`Attaching DuckLake database using command: ${attachCommand}`);
+   try {
+      await connection.runSQL(attachCommand);
+      logger.info(
+         `Successfully attached DuckLake database in READ_ONLY mode: ${dbName}`,
+      );
+   } catch (error) {
+      // Handle case where DuckLake database is already attached
+      if (
+         error instanceof Error &&
+         (error.message.includes("already exists") ||
+            error.message.includes("already attached"))
+      ) {
+         logger.info(
+            `DuckLake database ${dbName} is already attached, skipping`,
+         );
+      } else {
+         throw error;
+      }
+   }
 }
 
 async function attachCloudStorage(
@@ -488,9 +687,100 @@ async function attachCloudStorage(
       }
    }
 
+   if (await doesSecretExistInDuckDB(connection, secretName)) {
+      // Force refresh attachments using this storage
+      await connection.runSQL(`DETACH ${attachedDb.name};`).catch(() => {});
+   }
    await connection.runSQL(createSecretCommand);
+
    logger.info(`Created ${storageType} secret: ${secretName}`);
    logger.info(`${storageType} connection configured for: ${attachedDb.name}`);
+}
+
+async function attachAzureStorage(
+   connection: DuckDBConnection,
+   attachedDb: AttachedDatabase,
+): Promise<void> {
+   if (!attachedDb.azureConnection) {
+      throw new Error(
+         `Azure connection configuration missing for: ${attachedDb.name}`,
+      );
+   }
+
+   const config = attachedDb.azureConnection;
+
+   // Extensions are loaded once in attachDatabasesToDuckDB before the loop
+   const secretName = sanitizeSecretName(`azure_${attachedDb.name}`);
+
+   let createSecretCommand: string;
+
+   if (config.authType === "service_principal") {
+      if (
+         !config.tenantId ||
+         !config.clientId ||
+         !config.clientSecret ||
+         !config.accountName
+      ) {
+         throw new Error(
+            `Azure SPN auth requires tenantId, clientId, clientSecret, and accountName for: ${attachedDb.name}`,
+         );
+      }
+
+      const escapedTenantId = escapeSQL(config.tenantId);
+      const escapedClientId = escapeSQL(config.clientId);
+      const escapedClientSecret = escapeSQL(config.clientSecret);
+      const escapedAccountName = escapeSQL(config.accountName);
+
+      createSecretCommand = `
+         CREATE OR REPLACE SECRET ${secretName} (
+            TYPE azure,
+            PROVIDER service_principal,
+            TENANT_ID '${escapedTenantId}',
+            CLIENT_ID '${escapedClientId}',
+            CLIENT_SECRET '${escapedClientSecret}',
+            ACCOUNT_NAME '${escapedAccountName}'
+         );
+      `;
+   } else if (config.authType === "sas_token") {
+      if (!config.sasUrl) {
+         throw new Error(
+            `Azure SAS token auth requires sasUrl for: ${attachedDb.name}`,
+         );
+      }
+
+      // For SAS token auth, DuckDB can read the HTTPS SAS URL directly via httpfs.
+      // No Azure secret is needed — just ensure httpfs is loaded.
+      logger.info(
+         `Azure SAS token configured for: ${attachedDb.name} (no secret needed, using direct URL)`,
+      );
+      return;
+   } else {
+      throw new Error(
+         `Unsupported Azure auth type: ${config.authType} for: ${attachedDb.name}`,
+      );
+   }
+
+   if (await doesSecretExistInDuckDB(connection, secretName)) {
+      await connection.runSQL(`DETACH ${attachedDb.name};`).catch(() => {});
+   }
+   await connection.runSQL(createSecretCommand);
+
+   logger.info(`Created Azure secret: ${secretName}`);
+   logger.info(`Azure ADLS connection configured for: ${attachedDb.name}`);
+}
+
+async function doesSecretExistInDuckDB(
+   connection: DuckDBConnection,
+   secretName: string,
+): Promise<boolean> {
+   const escapedSecretName = escapeSQL(secretName);
+   const result = await connection.runSQL(`
+     SELECT COUNT(*) AS count
+     FROM duckdb_secrets()
+     WHERE name = '${escapedSecretName}';
+   `);
+   const rows = result.rows;
+   return Number(rows?.[0]?.count ?? 0) > 0;
 }
 
 // Main attachment function
@@ -504,7 +794,15 @@ async function attachDatabasesToDuckDB(
       postgres: attachPostgres,
       gcs: attachCloudStorage,
       s3: attachCloudStorage,
+      azure: attachAzureStorage,
    };
+
+   // Pre-load extensions needed by any attached database type, once per connection
+   const hasAzure = attachedDatabases.some((db) => db.type === "azure");
+   if (hasAzure) {
+      await installAndLoadExtension(duckdbConnection, "azure");
+      await installAndLoadExtension(duckdbConnection, "httpfs");
+   }
 
    for (const attachedDb of attachedDatabases) {
       try {
@@ -540,9 +838,195 @@ async function attachDatabasesToDuckDB(
    }
 }
 
+type ApiAzureConnection = components["schemas"]["AzureConnection"];
+
+/**
+ * Builds the actual Azure URL for a blob given an AzureConnection config.
+ * Strips any glob pattern from the base URL and appends the blob name.
+ */
+function buildAzureFileUrl(
+   azureConn: ApiAzureConnection,
+   blobName: string,
+): string {
+   if (azureConn.authType === "sas_token" && azureConn.sasUrl) {
+      const qIdx = azureConn.sasUrl.indexOf("?");
+      const baseUrl =
+         qIdx >= 0 ? azureConn.sasUrl.substring(0, qIdx) : azureConn.sasUrl;
+      const token = qIdx >= 0 ? azureConn.sasUrl.substring(qIdx) : "";
+      // Single file URL — replace the filename portion so we don't double-append
+      if (/\.(parquet|csv|json|jsonl|ndjson)$/i.test(baseUrl)) {
+         const dir = baseUrl.replace(/\/[^/]+$/, "");
+         return `${dir}/${blobName}${token}`;
+      }
+      // Glob or directory — strip trailing glob/slash and append blobName
+      const cleanBase = baseUrl.replace(/\/\*[^/]*$/, "").replace(/\/+$/, "");
+      return `${cleanBase}/${blobName}${token}`;
+   } else if (azureConn.authType === "service_principal" && azureConn.fileUrl) {
+      const url = azureConn.fileUrl;
+      // Single file URL (ends with a data file extension) — replace the
+      // filename with blobName so we don't double-append
+      if (/\.(parquet|csv|json|jsonl|ndjson)$/i.test(url)) {
+         return url.replace(/\/[^/]+$/, `/${blobName}`);
+      }
+      // Glob or directory — strip glob pattern and trailing slash, append blobName
+      const base = url.replace(/\*[^/]*$/, "").replace(/\/+$/, "");
+      return `${base}/${blobName}`;
+   }
+   throw new Error(
+      `Cannot build Azure file URL: missing sasUrl or fileUrl in config`,
+   );
+}
+
+/**
+ * Extends DuckDBConnection to resolve Azure attached-database table paths.
+ * When Malloy compiles di.table('azure_schema.blob_name'), the path
+ * 'azure_schema.blob_name' is passed to fetchTableSchema.  This override
+ * detects that prefix, constructs the real Azure URL, and forwards it to
+ * DuckDB so the azure/httpfs extension can read the file.
+ */
+class AzureDuckDBConnection extends DuckDBConnection {
+   private azureDatabases: AttachedDatabase[];
+
+   constructor(
+      connectionName: string,
+      databasePath: string,
+      workingDirectory: string,
+      azureDatabases: AttachedDatabase[],
+   ) {
+      super(connectionName, databasePath, workingDirectory);
+      this.azureDatabases = azureDatabases;
+   }
+
+   async fetchTableSchema(
+      tableKey: string,
+      tablePath: string,
+   ): Promise<TableSourceDef> {
+      const dotIdx = tablePath.indexOf(".");
+      if (dotIdx > 0) {
+         const schemaName = tablePath.substring(0, dotIdx);
+         const blobName = tablePath.substring(dotIdx + 1);
+
+         const azureDb = this.azureDatabases.find(
+            (db) =>
+               db.type === "azure" &&
+               db.name === schemaName &&
+               db.azureConnection,
+         );
+
+         if (azureDb) {
+            const azureUrl = buildAzureFileUrl(
+               azureDb.azureConnection!,
+               blobName,
+            );
+            logger.debug("Resolved Azure table path", {
+               original: tablePath,
+               resolved: azureUrl,
+            });
+            const result = await super.fetchTableSchema(tableKey, azureUrl);
+            if (!result) {
+               throw new Error(`Azure file not found: ${azureUrl}`);
+            }
+            return result;
+         }
+      }
+
+      const result = await super.fetchTableSchema(tableKey, tablePath);
+      if (!result) {
+         throw new Error(`Table ${tablePath} not found`);
+      }
+      return result;
+   }
+}
+
+class DuckLakeConnection extends DuckDBConnection {
+   private connectionName: string;
+
+   constructor(
+      connectionName: string,
+      databasePath: string,
+      workingDirectory: string,
+   ) {
+      super(connectionName, databasePath, workingDirectory);
+
+      // Validate that this is a DuckLake connection by checking the database path pattern
+      if (!databasePath.endsWith("_ducklake.duckdb")) {
+         throw new Error(
+            `DuckLakeConnection should only be used for DuckLake connections. ` +
+               `Expected database path ending with '_ducklake.duckdb', got: ${databasePath}`,
+         );
+      }
+
+      this.connectionName = connectionName;
+   }
+
+   async fetchTableSchema(
+      tableKey: string,
+      tablePath: string,
+   ): Promise<TableSourceDef> {
+      // DuckLake-specific logic: prefix table path with connection name if needed
+      const parts = tablePath.split(".");
+      if (
+         !tablePath.startsWith(this.connectionName) &&
+         (parts.length === 1 || parts.length === 2)
+      ) {
+         const prefixedPath = `${this.connectionName}.${tablePath}`;
+         logger.debug("Prefixing DuckLake table path", {
+            original: tablePath,
+            prefixed: prefixedPath,
+            connectionName: this.connectionName,
+         });
+         const result = await super.fetchTableSchema(tableKey, prefixedPath);
+         if (!result) {
+            throw new Error(
+               `Table ${prefixedPath} not found in connection ${this.connectionName}`,
+            );
+         }
+         return result;
+      }
+      // If already prefixed or has 3+ parts, use as-is;
+      // For attached databases, in the future
+      const result = await super.fetchTableSchema(tableKey, tablePath);
+      if (!result) {
+         throw new Error(
+            `Table ${tablePath} not found in connection ${this.connectionName}`,
+         );
+      }
+      return result;
+   }
+}
+
+export async function deleteDuckLakeConnectionFile(
+   connectionName: string,
+   projectPath: string,
+): Promise<void> {
+   const ducklakePath = path.join(
+      projectPath,
+      `${connectionName}_ducklake.duckdb`,
+   );
+   try {
+      await fs.access(ducklakePath);
+      await fs.rm(ducklakePath);
+      logger.info(
+         `Removed DuckLake connection file ${connectionName}_ducklake.duckdb from ${projectPath}`,
+      );
+   } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+         logger.debug(
+            `DuckLake connection file ${connectionName}_ducklake.duckdb does not exist, skipping deletion`,
+         );
+      } else {
+         logger.error(
+            `Failed to remove DuckLake connection file ${connectionName}_ducklake.duckdb from ${projectPath}`,
+            { error },
+         );
+      }
+   }
+}
+
 export async function createProjectConnections(
    connections: ApiConnection[] = [],
    projectPath: string = "",
+   isUpdateConnectionRequest: boolean = false,
 ): Promise<{
    malloyConnections: Map<string, BaseConnection>;
    apiConnections: InternalConnection[];
@@ -678,6 +1162,23 @@ export async function createProjectConnections(
                throw new Error("Snowflake warehouse is required.");
             }
 
+            // Store OAuth config for per-request connection creation
+            if (connection.snowflakeConnection.oauthPassthrough) {
+               setOAuthConfig(connection.name, {
+                  name: connection.name,
+                  account: connection.snowflakeConnection.account,
+                  warehouse: connection.snowflakeConnection.warehouse,
+                  database: connection.snowflakeConnection.database,
+                  schema: connection.snowflakeConnection.schema,
+                  role: connection.snowflakeConnection.role,
+                  responseTimeoutMilliseconds:
+                     connection.snowflakeConnection.responseTimeoutMilliseconds,
+               });
+               logger.info(
+                  `[OAuth] Snowflake connection '${connection.name}' has oauthPassthrough enabled`,
+               );
+            }
+
             let privateKeyPath = undefined;
 
             if (connection.snowflakeConnection.privateKey) {
@@ -772,21 +1273,29 @@ export async function createProjectConnections(
             // Create DuckDB connection with project basePath as working directory
             // This ensures relative paths in the project are resolved correctly
             // Use unique memory database path to prevent sharing across connections
-            const duckdbConnection = new DuckDBConnection(
-               connection.name,
-               path.join(projectPath, `${connection.name}.duckdb`),
-               projectPath,
+            const attachedDatabases =
+               connection.duckdbConnection.attachedDatabases ?? [];
+            const hasAzureAttached = attachedDatabases.some(
+               (db) => db.type === "azure",
             );
+            const duckdbConnection = hasAzureAttached
+               ? new AzureDuckDBConnection(
+                    connection.name,
+                    path.join(projectPath, `${connection.name}.duckdb`),
+                    projectPath,
+                    attachedDatabases,
+                 )
+               : new DuckDBConnection(
+                    connection.name,
+                    path.join(projectPath, `${connection.name}.duckdb`),
+                    projectPath,
+                 );
 
             // Attach databases if configured
-            if (
-               connection.duckdbConnection.attachedDatabases &&
-               Array.isArray(connection.duckdbConnection.attachedDatabases) &&
-               connection.duckdbConnection.attachedDatabases.length > 0
-            ) {
+            if (attachedDatabases.length > 0) {
                await attachDatabasesToDuckDB(
                   duckdbConnection,
-                  connection.duckdbConnection.attachedDatabases,
+                  attachedDatabases,
                );
             }
 
@@ -826,6 +1335,40 @@ export async function createProjectConnections(
             break;
          }
 
+         case "ducklake": {
+            if (!connection.ducklakeConnection) {
+               throw new Error("DuckLake connection configuration is missing.");
+            }
+
+            // Creating one Connection per DuckLake connection to avoid conflicts with other connections and better isolation.
+            const ducklakeDuckdbConnection = new DuckLakeConnection(
+               connection.name,
+               path.join(projectPath, `${connection.name}_ducklake.duckdb`),
+               projectPath,
+            );
+
+            // Only attach DuckLake if it's not already attached or is it an update connection request
+            if (
+               isUpdateConnectionRequest ||
+               !(await isDatabaseAttached(
+                  ducklakeDuckdbConnection,
+                  connection.name,
+               ))
+            ) {
+               await attachDuckLake(
+                  ducklakeDuckdbConnection,
+                  connection.name,
+                  connection.ducklakeConnection,
+               );
+            }
+
+            connectionMap.set(connection.name, ducklakeDuckdbConnection);
+            connection.attributes = getConnectionAttributes(
+               ducklakeDuckdbConnection,
+            );
+            break;
+         }
+
          default: {
             throw new Error(`Unsupported connection type: ${connection.type}`);
          }
@@ -858,6 +1401,7 @@ function getConnectionAttributes(
    };
 }
 
+// TODO: Re-write these tests to validate based on credentials provided in the connection config
 async function testDuckDBConnection(
    duckdbConnection: DuckDBConnection,
    connectionConfig: InternalConnection,
@@ -923,16 +1467,44 @@ async function testDuckDBConnection(
                );
                break;
             }
-            case "gcs":
-            case "s3": {
-               // For cloud storage, verify the secret was created
-               // Cloud storage doesn't attach as a database, it uses secrets for auth
+            case "gcs": {
                await duckdbConnection.runSQL(
                   `SELECT name FROM duckdb_secrets() WHERE name LIKE '%${attachedDb.name}%' LIMIT 1`,
                );
                logger.info(
                   `Cloud storage credentials test passed: ${attachedDb.name}`,
                );
+               break;
+            }
+            case "s3": {
+               await duckdbConnection.runSQL(
+                  `SELECT name FROM duckdb_secrets() WHERE name LIKE '%${attachedDb.name}%' LIMIT 1`,
+               );
+               logger.info(
+                  `Cloud storage credentials test passed: ${attachedDb.name}`,
+               );
+               break;
+            }
+            case "azure": {
+               const azureConfig = attachedDb.azureConnection;
+               if (azureConfig?.authType === "sas_token") {
+                  // SAS token is embedded in the URL — no DuckDB secret is created.
+                  if (!azureConfig.sasUrl) {
+                     throw new Error(
+                        `Azure SAS token URL is missing for: ${attachedDb.name}`,
+                     );
+                  }
+                  logger.info(
+                     `Azure SAS token URL present for: ${attachedDb.name}`,
+                  );
+               } else {
+                  await duckdbConnection.runSQL(
+                     `SELECT name FROM duckdb_secrets() WHERE name LIKE '%${attachedDb.name}%' LIMIT 1`,
+                  );
+                  logger.info(
+                     `Azure SPN credentials test passed: ${attachedDb.name}`,
+                  );
+               }
                break;
             }
             default: {
@@ -958,6 +1530,7 @@ async function testDuckDBConnection(
 export async function testConnectionConfig(
    connectionConfig: ApiConnection,
 ): Promise<ApiConnectionStatus> {
+   let malloyConnections: Map<string, BaseConnection> | null = null;
    try {
       // Validate that connection name is provided
       if (!connectionConfig.name) {
@@ -965,9 +1538,10 @@ export async function testConnectionConfig(
       }
 
       // Use createProjectConnections to create the connection, then test it
-      const { malloyConnections } = await createProjectConnections(
+      const result = await createProjectConnections(
          [connectionConfig], // Pass the single connection config
       );
+      malloyConnections = result.malloyConnections;
 
       // Get the created connection
       const connection = malloyConnections.get(connectionConfig.name);
@@ -982,6 +1556,25 @@ export async function testConnectionConfig(
          await testDuckDBConnection(
             connection as DuckDBConnection,
             connectionConfig as InternalConnection,
+         );
+      } else if (connectionConfig.type === "ducklake") {
+         // DuckLake uses DuckDB internally — verify the database is attached
+         const duckConn = connection as DuckDBConnection;
+         const attached = await isDatabaseAttached(
+            duckConn,
+            connectionConfig.name as string,
+         );
+         if (!attached) {
+            throw new Error(
+               `DuckLake connection test failed: Error attaching database '${connectionConfig.name}'`,
+            );
+         }
+         await duckConn.runSQL(
+            `SELECT schema_name FROM information_schema.schemata WHERE catalog_name = '${connectionConfig.name}' LIMIT 1`,
+         );
+
+         logger.info(
+            `DuckLake connection test passed: ${connectionConfig.name}`,
          );
       } else {
          // Test other connection types using their test() method
@@ -1010,5 +1603,30 @@ export async function testConnectionConfig(
          status: "failed",
          errorMessage: (error as Error).message,
       };
+   } finally {
+      // Cleanup: close all connections and remove ducklake files created during testing
+      if (malloyConnections) {
+         for (const [connName, conn] of malloyConnections) {
+            try {
+               // Close the connection
+               if (
+                  conn &&
+                  typeof (conn as DuckDBConnection).close === "function"
+               ) {
+                  await (conn as DuckDBConnection).close();
+               }
+            } catch (closeError) {
+               logger.warn(
+                  `Error closing connection ${connName} during test cleanup`,
+                  { error: closeError },
+               );
+            } finally {
+               // Remove ducklake files created during testing (only for ducklake connections)
+               if (connectionConfig.type === "ducklake") {
+                  await deleteDuckLakeConnectionFile(connName, process.cwd());
+               }
+            }
+         }
+      }
    }
 }

@@ -3,7 +3,19 @@ import fs from "fs/promises";
 import path from "path";
 import sinon from "sinon";
 import { DuckDBConnection } from "@malloydata/db-duckdb";
-import { createProjectConnections, testConnectionConfig } from "./connection";
+import { SnowflakeConnection } from "@malloydata/db-snowflake";
+import { Connection } from "@malloydata/malloy";
+import {
+   closeOAuthConnections,
+   createOAuthSnowflakeConnection,
+   createProjectConnections,
+   getOAuthConfig,
+   getRequestConnections,
+   setOAuthConfig,
+   SnowflakeOAuthConfig,
+   testConnectionConfig,
+} from "./connection";
+import { requestContext } from "../request_context";
 import { components } from "../api";
 
 type ApiConnection = components["schemas"]["Connection"];
@@ -975,6 +987,111 @@ describe("connection integration tests", () => {
       });
 
       describe("error handling", () => {
+         describe("DuckLake connection type", () => {
+            it(
+               "should create DuckLake connection",
+               async () => {
+                  if (!hasPostgresCredentials() || !hasS3Credentials()) {
+                     console.log(
+                        "Skipping: PostgreSQL and S3 credentials not configured",
+                     );
+                     return;
+                  }
+
+                  const { malloyConnections } = await createProjectConnections(
+                     [
+                        {
+                           name: "ducklake_test",
+                           type: "ducklake",
+                           ducklakeConnection: {
+                              catalog: {
+                                 postgresConnection: {
+                                    host: process.env.POSTGRES_TEST_HOST,
+                                    port: parseInt(
+                                       process.env.POSTGRES_TEST_PORT || "5432",
+                                    ),
+                                    userName: process.env.POSTGRES_TEST_USER!,
+                                    password:
+                                       process.env.POSTGRES_TEST_PASSWORD!,
+                                    databaseName:
+                                       process.env.POSTGRES_TEST_DATABASE,
+                                 },
+                              },
+                              storage: {
+                                 bucketUrl:
+                                    process.env.S3_TEST_BUCKET_URL ||
+                                    "s3://test-bucket",
+                                 s3Connection: {
+                                    accessKeyId:
+                                       process.env.S3_TEST_ACCESS_KEY_ID!,
+                                    secretAccessKey:
+                                       process.env.S3_TEST_SECRET_ACCESS_KEY!,
+                                 },
+                              },
+                           },
+                        },
+                     ],
+                     testProjectPath,
+                  );
+
+                  const connection = malloyConnections.get(
+                     "ducklake_test",
+                  ) as DuckDBConnection;
+                  createdConnections.push(connection);
+                  expect(connection).toBeDefined();
+
+                  // Verify DuckLake database is attached
+                  const databases = await connection.runSQL("SHOW DATABASES");
+                  const dbNames = databases.rows.map(
+                     (row) => Object.values(row)[0],
+                  );
+                  expect(dbNames).toContain("ducklake_test");
+               },
+               { timeout: 30000 },
+            );
+
+            it("should throw error if DuckLake catalog connection is missing", async () => {
+               await expect(
+                  createProjectConnections(
+                     [
+                        {
+                           name: "ducklake_no_catalog",
+                           type: "ducklake",
+                           ducklakeConnection: {
+                              storage: {
+                                 bucketUrl: "s3://test-bucket",
+                                 s3Connection: {
+                                    accessKeyId: "test",
+                                    secretAccessKey: "test",
+                                 },
+                              },
+                           },
+                        } as ApiConnection,
+                     ],
+                     testProjectPath,
+                  ),
+               ).rejects.toThrow(
+                  /PostgreSQL connection configuration is required/,
+               );
+            });
+
+            it("should throw error if DuckLake connection config is missing", async () => {
+               await expect(
+                  createProjectConnections(
+                     [
+                        {
+                           name: "ducklake_missing_config",
+                           type: "ducklake",
+                        },
+                     ],
+                     testProjectPath,
+                  ),
+               ).rejects.toThrow(
+                  /DuckLake connection configuration is missing/,
+               );
+            });
+         });
+
          it("should throw error if DuckDB connection name conflicts with attached database", async () => {
             await expect(
                createProjectConnections(
@@ -1222,5 +1339,152 @@ describe("connection integration tests", () => {
          },
          { timeout: 30000 },
       );
+   });
+});
+
+describe("OAuth pass-through helpers", () => {
+   const baseConfig: SnowflakeOAuthConfig = {
+      name: "sf-conn",
+      account: "test-account.us-east-1",
+      warehouse: "COMPUTE_WH",
+      database: "ANALYTICS",
+      schema: "PUBLIC",
+      role: "ANALYST",
+   };
+
+   afterEach(() => {
+      sinon.restore();
+   });
+
+   describe("setOAuthConfig / getOAuthConfig", () => {
+      it("should store and retrieve OAuth config by name", () => {
+         setOAuthConfig("my-conn", baseConfig);
+         const stored = getOAuthConfig("my-conn");
+         expect(stored).toEqual(baseConfig);
+      });
+
+      it("should return undefined for unknown connection name", () => {
+         expect(getOAuthConfig("non-existent")).toBeUndefined();
+      });
+
+      it("should overwrite previous config for the same name", () => {
+         setOAuthConfig("my-conn", baseConfig);
+         const updated = { ...baseConfig, warehouse: "LARGE_WH" };
+         setOAuthConfig("my-conn", updated);
+         expect(getOAuthConfig("my-conn")?.warehouse).toBe("LARGE_WH");
+      });
+   });
+
+   describe("createOAuthSnowflakeConnection", () => {
+      it("should create a SnowflakeConnection instance", () => {
+         const conn = createOAuthSnowflakeConnection(
+            baseConfig,
+            "oauth-token-123",
+         );
+         expect(conn).toBeInstanceOf(SnowflakeConnection);
+      });
+
+      it("should work with minimal config (no optional fields)", () => {
+         const minimalConfig: SnowflakeOAuthConfig = {
+            name: "minimal",
+            account: "acct",
+            warehouse: "WH",
+         };
+         const conn = createOAuthSnowflakeConnection(minimalConfig, "token");
+         expect(conn).toBeInstanceOf(SnowflakeConnection);
+      });
+   });
+
+   describe("getRequestConnections", () => {
+      it("should return original map when no database token is present", () => {
+         // No requestContext.run() — getDatabaseToken() returns undefined
+         const original = new Map<string, any>([["conn1", { name: "conn1" }]]);
+         const result = getRequestConnections(original);
+
+         expect(result.connections).toBe(original);
+         expect(result.oauthConnections).toHaveLength(0);
+      });
+
+      it("should override connections that have OAuth config when token present", () => {
+         const connName = "sf-conn-override-test";
+         setOAuthConfig(connName, baseConfig);
+
+         const mockSfConn = {
+            name: connName,
+         } as unknown as Connection;
+         const mockOtherConn = {
+            name: "duckdb",
+         } as unknown as Connection;
+         const original = new Map<string, Connection>([
+            [connName, mockSfConn],
+            ["duckdb", mockOtherConn],
+         ]);
+
+         // Run inside requestContext so getDatabaseToken() returns a token
+         requestContext.run({ databaseToken: "user-token" }, () => {
+            const result = getRequestConnections(original);
+
+            // The overridden map should have the same keys
+            expect(result.connections.size).toBe(2);
+            // sf-conn should be replaced (different instance)
+            expect(result.connections.get(connName)).not.toBe(mockSfConn);
+            expect(result.connections.get(connName)).toBeInstanceOf(
+               SnowflakeConnection,
+            );
+            // duckdb should be unchanged
+            expect(result.connections.get("duckdb")).toBe(mockOtherConn);
+            // One OAuth connection created
+            expect(result.oauthConnections).toHaveLength(1);
+         });
+      });
+
+      it("should not override connections without OAuth config", () => {
+         // Use a unique connection name that has no OAuth config registered
+         const original = new Map<string, any>([
+            ["sf-conn-no-config", { name: "sf-conn-no-config" }],
+         ]);
+
+         requestContext.run({ databaseToken: "user-token" }, () => {
+            const result = getRequestConnections(original);
+
+            expect(result.connections.size).toBe(1);
+            expect(result.oauthConnections).toHaveLength(0);
+         });
+      });
+   });
+
+   describe("closeOAuthConnections", () => {
+      it("should call close() on each connection", async () => {
+         const conn1 = { close: sinon.stub().resolves() };
+         const conn2 = { close: sinon.stub().resolves() };
+
+         await closeOAuthConnections([conn1 as any, conn2 as any]);
+
+         expect(conn1.close.calledOnce).toBe(true);
+         expect(conn2.close.calledOnce).toBe(true);
+      });
+
+      it("should handle connections without a close method", async () => {
+         const conn = {} as any;
+         // Should not throw
+         await closeOAuthConnections([conn]);
+      });
+
+      it("should catch errors and continue closing", async () => {
+         const failing = {
+            close: sinon.stub().rejects(new Error("close failed")),
+         };
+         const succeeding = { close: sinon.stub().resolves() };
+
+         await closeOAuthConnections([failing as any, succeeding as any]);
+
+         expect(failing.close.calledOnce).toBe(true);
+         expect(succeeding.close.calledOnce).toBe(true);
+      });
+
+      it("should do nothing for an empty array", async () => {
+         // Should not throw
+         await closeOAuthConnections([]);
+      });
    });
 });
