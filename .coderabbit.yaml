@@ -1,0 +1,77 @@
+# CodeRabbit configuration
+# Docs: https://docs.coderabbit.ai/reference/configuration
+#
+# Stack: TypeScript, Node, bun, eslint, vitest
+
+language: en-US
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  commit_status: true
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  suggested_labels: true
+  suggested_reviewers: false
+  poem: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 5
+    drafts: false
+    base_branches:
+      - "main"
+    ignore_title_keywords:
+      - "WIP"
+      - "DRAFT"
+      - "DO NOT MERGE"
+    ignore_usernames:
+      # Include both bare names (for OAuth-based bots) and GitHub-App
+      # logins (suffixed with "[bot]"); CodeRabbit's ignore_usernames
+      # uses exact-match.
+      - "dependabot"
+      - "dependabot[bot]"
+      - "renovate"
+      - "renovate[bot]"
+      - "coderabbitai"
+      - "coderabbitai[bot]"
+
+  path_filters:
+    - "!**/*.lock"
+    - "!**/bun.lock"
+    - "!**/package-lock.json"
+    - "!**/pnpm-lock.yaml"
+    - "!**/yarn.lock"
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/build/**"
+    - "!**/.next/**"
+    - "!**/coverage/**"
+    - "!**/.idea/**"
+    - "!**/.vscode/**"
+    - "!**/*.js.map"
+
+  tools:
+    eslint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    yamllint:
+      enabled: true
+    shellcheck:
+      enabled: true
+
+chat:
+  # Disable auto-reply to block prompt-injection via PR comments.
+  auto_reply: false
+
+knowledge_base:
+  # Scope learnings and issues to this repo only. Prevents a public PR from
+  # poisoning a shared knowledge store used across other repositories.
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  code_guidelines:
+    enabled: true
